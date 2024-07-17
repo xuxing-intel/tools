@@ -23,7 +23,7 @@
 #endif
 
 #include "metrics_calc_lite_utils.h"
-
+#include <queue>
 #define MASK_PSNR      (1 << 0)
 #define MASK_APSNR     (1 << 1)
 #define MASK_MSE       (1 << 2)
@@ -728,6 +728,16 @@ const int ssim_ctx_cnt = 8; // Support up to 8 threads if compiled with enabled 
 const int ssim_ctx_cnt = 1; // Default to sequential MS-SSIM evaluation
 #endif
 const float artifacts_threshold = 0.3f;
+int cur_frame_no = 0;
+int dump_pixel_ssim_num = 0;
+int layer1_width = 0, layer2_width = 0;
+std::string pixel_ssim_dir_path = "";
+std::priority_queue<
+    std::tuple<double, int, std::vector<double>, std::vector<double>>, 
+    std::vector<std::tuple<double, int, std::vector<double>, std::vector<double>>>, 
+    std::greater<std::tuple<double, int, std::vector<double>, std::vector<double>>>> 
+    bottom_n_pixel_ssim;
+
 
 class CMSSIMEvaluator : public CMetricEvaluator {
 private:
@@ -769,7 +779,7 @@ private:
     }
 
     inline void getSSIMIndexes_32f_R(Ipp32f* pSrc1, Ipp32f* pSrc2, const int srcStep, const int x_offset, const int y_offset, const IppiSize ds_roi, ssim_context *pCtx,
-        const Ipp32f* xknl, const int xsz, const Ipp32f* yknl, const int ysz, const Ipp32f C1, const Ipp32f C2, double &mssim, double &mcs, int &artf)
+        const Ipp32f* xknl, const int xsz, const Ipp32f* yknl, const int ysz, const Ipp32f C1, const Ipp32f C2, double &mssim, double &mcs, int &artf, std::vector<Ipp64f>& pixelssim)
     {
         int      i, j;
         Ipp32f **pTmp;
@@ -837,6 +847,7 @@ private:
 
                 mcs += t2 / (Ipp64f)t4;
                 tmp = (t1*t2) / (Ipp64f)(t3*t4);
+                pixelssim.push_back(tmp);
                 mssim += tmp;
                 if (tmp < artifacts_threshold) (artf)++;
                 pMx++; pMy++; pSx2++; pSy2++; pSxy++;
@@ -1004,13 +1015,16 @@ public:
         IppiSize    pr_roi, ds_roi;
         IppiPoint   dstOffset = { 0, 0 };
         Ipp32f     *pSrc1, *pSrc2, *pTmp, *pTmp1;
+        std::vector<Ipp64f> pixelssim_l1, pixelssim_l2;
+        double min_ssim = 1.0;
+
 
         for (i = 0; i<(int)m_num_planes; i++) {
             if (c_mask[i] & (MASK_MSSIM | MASK_SSIM | MASK_ARTIFACTS)) {
                 m_i1->GetFrame(i, &i1_p); m_i2->GetFrame(i, &i2_p);
                 pSrc1 = m_im1; pSrc2 = m_im2; pTmp = m_imt;
                 depth = (c_mask[i] & (MASK_MSSIM | MASK_ARTIFACTS)) ? mmsim_depth : 1;
-                for (k = 0; k<depth; k++) {
+                for (k = 0; k< 3; k++) {
                     if (k) {
                         pr_roi = ds_roi; ds_roi.width = pr_roi.width >> 1; ds_roi.height = pr_roi.height >> 1;
                         pr_roi.width &= ~0x1; pr_roi.height &= ~0x1; // Possibly discard last column/row to match reference MS-SSIM code
@@ -1046,19 +1060,35 @@ public:
 #if defined(_OPENMP)
                     #pragma omp parallel for reduction( + : mssim_a, mcs_a, artcnt_a )
 #endif
-                    for (r = 0; r < patch_cnt; r++) {
-                        IppiSize p_roi = ds_roi;
-                        int x_offset = (mc_ksz[m_xkidx[i]] >> 1);
-                        int y_offset = (mc_ksz[m_ykidx[i]] >> 1) + r * patch_height;
-                        double mssim_l = 0.0, mcs_l = 0.0;
-                        int    artcnt_l = 0;
+                    std::vector<Ipp64f> pixelssim;
+                    if (k != 0) {
+                        for (r = 0; r < patch_cnt; r++) {
+                            IppiSize p_roi = ds_roi;
+                            int x_offset = (mc_ksz[m_xkidx[i]] >> 1);
+                            int y_offset = (mc_ksz[m_ykidx[i]] >> 1) + r * patch_height;
+                            double mssim_l = 0.0, mcs_l = 0.0;
+                            int    artcnt_l = 0;
 
-                        p_roi.width = ds_roi.width;
-                        p_roi.height = (r != (patch_cnt - 1)) ? patch_height : ds_roi.height - mc_ksz[m_ykidx[i]] + 1 - r * patch_height;
+                            p_roi.width = ds_roi.width;
+                            p_roi.height = (r != (patch_cnt - 1)) ? patch_height : ds_roi.height - mc_ksz[m_ykidx[i]] + 1 - r * patch_height;
 
-                        getSSIMIndexes_32f_R(pSrc1, pSrc2, m_step, x_offset, y_offset, p_roi, m_ssim_ctx + r, mc_krn[m_xkidx[i]], mc_ksz[m_xkidx[i]], mc_krn[m_ykidx[i]], mc_ksz[m_ykidx[i]], m_ssim_c1, m_ssim_c2 + m_ssim_c1, mssim_l, mcs_l, artcnt_l);
-                        mssim_a += mssim_l; mcs_a += mcs_l; artcnt_a += artcnt_l;
+                            getSSIMIndexes_32f_R(pSrc1, pSrc2, m_step, x_offset, y_offset, p_roi, m_ssim_ctx + r, mc_krn[m_xkidx[i]], mc_ksz[m_xkidx[i]], mc_krn[m_ykidx[i]], mc_ksz[m_ykidx[i]], m_ssim_c1, m_ssim_c2 + m_ssim_c1, mssim_l, mcs_l, artcnt_l, pixelssim);
+                            mssim_a += mssim_l; mcs_a += mcs_l; artcnt_a += artcnt_l;
+                        }
                     }
+
+                    if (dump_pixel_ssim_num != 0 && i == 0 && k == 1) {
+                        for (auto it = pixelssim.begin(); it != pixelssim.end(); it++) {
+                            if (min_ssim > *it) min_ssim = *it;
+                        }
+                        layer1_width = i_width;
+                        pixelssim_l1 = pixelssim;
+                    }
+                    if (dump_pixel_ssim_num != 0 && i == 0 && k == 2) {
+                        layer2_width = i_width;
+                        pixelssim_l2 = pixelssim;
+                    }
+
 
                     mssim[k] = mssim_a/(double)(i_width * i_height);
                     mcs[k] = mcs_a/(double)(i_width * i_height);
@@ -1078,6 +1108,9 @@ public:
                 if (c_mask[i] & MASK_ARTIFACTS) af_idx[i] = 0.5*(artcnt[3] + artcnt[4]);
             }
         }
+
+        bottom_n_pixel_ssim.push({ min_ssim, cur_frame_no, pixelssim_l1, pixelssim_l2 });
+        if (bottom_n_pixel_ssim.size() > dump_pixel_ssim_num) { bottom_n_pixel_ssim.pop(); }
 
         for (i = 0; i<(int)m_num_planes; i++) {
             if (c_mask[i] & MASK_MSSIM) {
@@ -1308,6 +1341,7 @@ int32_t usage(void)
     std::cout << "    -btm_first          - bottom field first for interlaced sources" << std::endl;
     std::cout << "    -btm_first1         - bottom field first for the 1st source" << std::endl;
     std::cout << "    -btm_first2         - bottom field first for the 2nd source" << std::endl;
+    std::cout << "    -ps                 - dump per pixel ssim to txt file in directory per_pixel_ssim" << std::endl;
     std::cout << "NOTES:    1. Different chromaticity representations can be compared on Y channel only." << std::endl;
     std::cout << "          2. In case of 10 bits non-zero values must be located from bit #0 to bit #9." << std::endl;
     std::cout << "             If such bits are located from bit #6 to bit #15 use parameters \"-rshift1 6 -rshift2 6\"" << std::endl;
@@ -1493,6 +1527,14 @@ int32_t main(int32_t argc, char** argv)
             if(is_interlaced(sq1_type)!=is_interlaced(sq2_type)) {
                 std::cout << errors_table[8] << std::endl; return -8;
             }
+        } else if (strcmp(argv[cur_param], "-ps") == 0 && cur_param + 1 < argc ) {
+            dump_pixel_ssim_num = atoi(argv[cur_param + 1]);
+            pixel_ssim_dir_path = argv[cur_param + 2];
+            cur_param += 3;
+            std::cout << "Will dump per pixel ssim to txt file in directory per_pixel_ssim!!!\n";
+            std::string command;
+            command = "mkdir " + pixel_ssim_dir_path;
+            system(command.c_str());
         } else break;
     }
 
@@ -1627,6 +1669,7 @@ int32_t main(int32_t argc, char** argv)
         if(fm1_frst == seek_from1) { fm1_frst = seek_to1; }
         if(fm2_frst == seek_from2) { fm2_frst = seek_to2; }
         reader1->ReadRawFrame(fm1_frst); reader2->ReadRawFrame(fm2_frst);
+        cur_frame_no = i;
         for (j = 0; j < (int)mevs.size(); j++) mevs[j]->ComputeMetrics(all_values[i],avg_values);
     }
 
@@ -1649,6 +1692,42 @@ int32_t main(int32_t argc, char** argv)
                 std::cout << " " << std::setw(8) << std::setprecision(5) << std::setiosflags(std::ios::fixed) << all_values[j][i];
             }
             std::cout << "</pfr_metric>"<< std::endl;
+        }
+
+    }
+
+    if (dump_pixel_ssim_num) {
+        while (!bottom_n_pixel_ssim.empty()) {
+            std::tuple<double, int, std::vector<double>, std::vector<double>> element = bottom_n_pixel_ssim.top();
+            bottom_n_pixel_ssim.pop();
+            for (int l = 1; l < 3; l++) {
+                std::stringstream ssfilename;
+                ssfilename << "frame_" << std::get<1>(element) << "_L"<<l<<"_minssim_" << std::setprecision(4) << std::get<0>(element) << ".txt";
+                std::ofstream outfile(pixel_ssim_dir_path + '\\' + ssfilename.str());
+                if (outfile) {
+                    int count = 0, curr_layer_width;
+                    std::vector<Ipp64f> pixelssim;
+                    if (l == 1) { 
+                        curr_layer_width = layer1_width;
+                        pixelssim = std::get<2>(element);
+                    }
+                    else { 
+                        curr_layer_width = layer2_width;
+                        pixelssim = std::get<3>(element);
+                    }
+                    for (auto it = pixelssim.begin(); it != pixelssim.end(); it++) {
+                        outfile << std::setprecision(4) << std::setiosflags(std::ios::fixed) << *it << " ";
+                        if (count++ == curr_layer_width - 1 && it + 1 != pixelssim.end()) {
+                            outfile << std::endl;
+                            count = 0;
+                        }
+                    }
+                    outfile.close();
+                }
+                else {
+                    std::cout << "create per pixel ssim txt file failed" << std::endl;
+                }
+            }
         }
     }
 

@@ -36,6 +36,9 @@
 #include <memory>
 #include <vector>
 #include <algorithm>
+#include <sstream>
+#include <fstream>
+#include <filesystem>
 
 //#define NO_IPP
 
